@@ -114,3 +114,116 @@ free :
     return ret;
 }
 
+int parse_recv_msg_check(const char* xml, int len, char* msg_id, 
+    int (*check_func)(char* body, int len, void* priv), void* priv)
+{
+    int ret = -EINVAL, msg_cnt, pos;
+    struct recv_msg* i, *i_next = NULL;
+
+    xmlDocPtr doc = xmlReadMemory(xml, len, "noname.xml", NULL, 0);
+    if (!doc) {
+        fprintf(stderr, "unable to read memory\n");
+        return ret;
+    }
+
+    xmlNodePtr cur = xmlDocGetRootElement(doc);
+    if (!cur) 
+        goto free;
+
+    cur = xmlFirstElementChild(cur);
+    msg_cnt = pos = 0;
+    while (cur) {
+        if (xmlStrcmp(cur->name, (const xmlChar *)"ReceiveMessageResult"))
+            goto next;
+
+        xmlNodePtr msg = xmlFirstElementChild(cur);
+        while (msg) {
+            //parse msg for ReceiptHandle, Body
+            xmlNodePtr msg_i = xmlFirstElementChild(msg);
+            xmlChar* handle = NULL, *body = NULL;
+
+            while (msg_i) {
+                if (!xmlStrcmp(msg_i->name, (const xmlChar *)"ReceiptHandle")) {
+                    if (handle)
+                        break;
+                    if (!(handle = xmlNodeGetContent(msg_i)))
+                        break;
+                }
+                else if (!xmlStrcmp(msg_i->name, (const xmlChar *)"Body")) {
+                    if (body)
+                        break;
+                    if (!(body = xmlNodeGetContent(msg_i)))
+                        break;
+                }
+
+                msg_i = xmlNextElementSibling(msg_i);
+            }
+
+            if (!msg_i && handle && body && check_func(body, strlen(body), priv)) { 
+                // sucess : check body, save msg_id
+                if (msg_id) {
+                    strcpy(&msg_id[pos], handle);
+                    pos += (strlen(handle) + 1);
+                    msg_id[pos - 1] = '\0';
+                }
+                msg_cnt++;
+            }
+            xmlFree(handle);
+            xmlFree(body);
+
+            msg = xmlNextElementSibling(msg);
+        }
+
+    next :
+        cur = cur->next;
+    }
+
+    ret = msg_cnt;
+   
+free :
+    xmlFreeDoc(doc);
+    return ret;
+}
+
+int parse_send_msg(const char* xml, int len, char* msg_id)
+{
+    int ret = -EINVAL, msg_cnt, pos;
+
+    xmlDocPtr doc = xmlReadMemory(xml, len, "noname.xml", NULL, 0);
+    if (!doc) {
+        fprintf(stderr, "unable to read memory\n");
+        return ret;
+    }
+
+    xmlNodePtr cur = xmlDocGetRootElement(doc);
+    if (!cur) 
+        goto free;
+
+    cur = xmlFirstElementChild(cur);
+    msg_cnt = pos = 0;
+    while (cur) {
+        if (xmlStrcmp(cur->name, (const xmlChar *)"SendMessageResult"))
+            goto next;
+
+        xmlNodePtr msg = xmlFirstElementChild(cur);
+        while (msg) {
+            if (!xmlStrcmp(msg->name, (const xmlChar *)"MessageId")) {
+                xmlChar* m = xmlNodeGetContent(msg);
+                strcpy(&msg_id[pos], m);
+                pos += (strlen(m) + 1);
+                msg_id[pos - 1] = '\0';
+                msg_cnt++;
+                xmlFree(m);
+            }
+            msg = xmlNextElementSibling(msg);
+        }
+    next : 
+        cur = cur->next;
+    }
+
+    ret = msg_cnt;
+
+free : 
+    xmlFreeDoc(doc);
+    return ret;
+}

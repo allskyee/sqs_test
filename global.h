@@ -12,6 +12,9 @@ struct recv_msg {
 
 int  parse_recv_msg(const char* xml, int len, struct list_head* l);
 void free_recv_msgs(struct list_head* head);
+int  parse_recv_msg_check(const char* xml, int len, char* msg_id, 
+        int (*check_func)(char* body, int len, void* priv), void* priv);
+int  parse_send_msg(const char* xml, int len, char* msg_id);
 
 
 struct iobuf_node {
@@ -29,8 +32,9 @@ struct iobuf {
 #define __debug(fmt, args ...)  do {} while(0)
 //#define __debug(fmt, args ...)  fprintf(stderr, fmt, ##args)
 
-#define HOSTNAME    "mq-2:6059"
-#define HOSTID      "396241819186"
+//#define HOSTNAME    "mq-2:6059"
+//#define HOSTID      "398690460065"
+//#define ACCESSKEY   "8BSQRC7XW1FPXB522YQ9"
 
 #define ARRAY_SIZE(arr) (sizeof((arr)) / sizeof(*(arr)))
 
@@ -40,5 +44,7 @@ void iobuf_init(struct iobuf* b);
 void iobuf_free(struct iobuf* b);
 
 void iobuf_cpy(char* buf, struct iobuf* b);
+
+#define MSGID_MAX_LEN  64
 
 #endif

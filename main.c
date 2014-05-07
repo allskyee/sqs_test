@@ -19,17 +19,27 @@
 ////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////
-//
+// recieve
 
-int __recv_message(int n, int delete)
+int recv_check_body(char* body, int len, void* priv) //1 is ok, 0 is not
+{
+    while (--len >= 0)
+        if (body[len] != 'x')
+            return 0;
+    return 1;
+}
+
+int __recv_message(int n, int verbose, char* msg_ids)
 {
     char* resp = NULL;
     int i, pos, ret = -ENOMEM, resp_len = (1 << 20); //1MB
     struct iobuf b;
+
+#define ERROR(fmt, args...) \
+    do { if (verbose) fprintf(stderr, fmt, ##args); } while (0)
     
     CURL* ch1 = curl_easy_init();
-    CURL* ch2 = curl_easy_init();
-    if (!ch1 || !ch2) {
+    if (!ch1) {
         fprintf(stderr, "unable to easy init\n");
         goto out;
     }
@@ -46,22 +56,14 @@ int __recv_message(int n, int delete)
     curl_easy_setopt (ch1, CURLOPT_POST, 1 );
     curl_easy_setopt (ch1, CURLOPT_POSTFIELDS, 
         "Action=ReceiveMessage&MaxNumberOfMessages=1" 
-        "&AWSAccessKeyId=RELQ7OTAGDO570Y9CMAQ&");
+        "&AWSAccessKeyId=" ACCESSKEY "&");
     curl_easy_setopt (ch1, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt (ch1, CURLOPT_WRITEDATA, &b);
 
-    curl_easy_setopt (ch2, CURLOPT_URL, 
-        "http://" HOSTNAME "/" HOSTID "/test_create_queue");
-    curl_easy_setopt (ch2, CURLOPT_POST, 1 );
-    curl_easy_setopt (ch2, CURLOPT_POSTFIELDS, resp); 
-    curl_easy_setopt (ch2, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt (ch2, CURLOPT_WRITEDATA, &b);
-
+    ret = 0;
     for (i = 0; i < n; i++) {
         CURLcode res;
-        int parsed;
-        struct list_head msgs;
-        struct recv_msg* recv_i;
+        int cnt;
 
         res = curl_easy_perform(ch1);
         if (res != CURLE_OK) {
@@ -79,71 +81,108 @@ int __recv_message(int n, int delete)
             break;
         }
 
-        //printf("%s\n", resp);
-        //parse received message
-        parsed = parse_recv_msg(resp, strlen(resp), &msgs);
-        if (parsed <= 0) {
-            if (parsed == 0)
-                ret = 0;//successful finish
-
-            free_recv_msgs(&msgs);
+        cnt = parse_recv_msg_check(resp, strlen(resp), 
+                msg_ids, recv_check_body, NULL);
+        if (cnt < 0) {
+            ERROR("2 %s\n", resp);
             break;
         }
-
-        //delete all recieved messages
-        list_for_each_entry(recv_i, &msgs, l)  {
-            sprintf(resp, "Action=DeleteMessage&ReceiptHandle=%s" 
-                "&AWSAccessKeyId=RELQ7OTAGDO570Y9CMAQ&", recv_i->handle);
-
-            res = curl_easy_perform(ch2);
-            if (res != CURLE_OK) {
-                fprintf(stderr, "curl_easy_perform() failed: %s\n",
-                    curl_easy_strerror(res));
-                break;
-            }
-
-            assert(resp_len > b.total_len);
-            iobuf_cpy(resp, &b);
-            iobuf_free(&b);
-            if (strncmp(resp, "<DeleteMessageResponse>",   
-                    strlen("<DeleteMessageResponse>")) != 0) {
-                break;
-            }
-
-            //printf("del : %s\n", resp);
-            
-            parsed--;
-        }
-
-        free_recv_msgs(&msgs);
-
-        if (parsed != 0)
+        if (cnt == 0) {
+            ERROR("no more message, %d received\n", i);
             break;
+        }
+        while (cnt--) 
+            msg_ids += (strlen(msg_ids) + 1);
+
+        ret++;
     }
-
-    if (i == n)
-        ret = 0;
-
-    printf("%d recieved \n", i);
 
 out : 
     free(resp);
     curl_easy_cleanup(ch1);
-    curl_easy_cleanup(ch2);
     return ret;
 }
 
 void* recv_message(void* tmp)
 {
     int n = *((int*)tmp);
-    return (void*)__recv_message(n, 0);
+    return (void*)__recv_message(n, 1, NULL);
+}
+
+void recv_message_save(int n)
+{
+    const int msg_id_len = 64;
+    char* msg_ids = malloc(msg_id_len * n);
+    FILE* f0 = NULL;
+    int msgs;
+    struct timespec start, end;
+    long long elapsed;
+    int ret = -ENOMEM, i, pos, max_retry;
+    
+    if (!msg_ids) { 
+        fprintf(stderr, "unable to allocate memory\n");
+        return;
+    }
+
+    if (!(f0 = fopen("recv_msg_id", "w"))) {
+        goto out;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    msgs = __recv_message(n, 0, msg_ids);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    if (msgs < 0) {
+        fprintf(stderr, "unable to receive any messages\n");
+        goto out;
+    }
+
+    elapsed = (end.tv_sec - start.tv_sec) * 1000000000 + 
+            (end.tv_nsec - start.tv_nsec);
+    printf("%f elapsed \n", elapsed / 1000000000.0);
+    printf("%d messages left\n", n - msgs);
+
+    // print message ids
+    for (i = 0, pos = 0; i < msgs; i++) {
+        char* msg_id = &msg_ids[pos];
+        fprintf(f0, "%s\n", msg_id);
+        pos += (strlen(msg_id) + 1);
+    }
+
+    n -= msgs;
+    max_retry = 10;
+    while (n > 0 && max_retry) {
+        msgs = __recv_message(n, 0, msg_ids);
+        if (msgs <= 0) {
+            fprintf(stderr, "unable to recv, sleeping 1 second, %d\n", msgs);
+            max_retry--;
+            sleep(1);
+            continue;
+        }
+
+        max_retry = 10;
+
+        for (i = 0, pos = 0; i < msgs; i++) {
+            char* msg_id = &msg_ids[pos];
+            fprintf(f0, "%s\n", msg_id);
+            pos += (strlen(msg_id) + 1);
+        }
+
+        n -= msgs;
+    }
+
+out : 
+    if (f0)
+        fclose(f0);
+    free(msg_ids);
 }
 
 ////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////
+// send
 
-int __send_message(int n, int size)
+int __send_message(int n, int size, int verbose, char* msg_ids)
 {
     char* body = NULL, *resp = NULL;
     int i, pos, ret = -ENOMEM, resp_len = 1024;
@@ -151,23 +190,23 @@ int __send_message(int n, int size)
 
     CURL* ch = curl_easy_init();
     if (!ch) {
-        fprintf(stderr, "unable to easy init\n");
+        ERROR("unable to easy init\n");
         return ret;
     }
 
     if (!(body = malloc(size + 256))) {
-        fprintf(stderr, "unable to alloc memory\n");
+        ERROR("unable to alloc memory\n");
         goto out;
     }
 
     if (!(resp = malloc(resp_len))) {
-        fprintf(stderr, "unable to alloc memory\n");
+        ERROR("unable to alloc memory\n");
         goto out;
     }
 
     pos = snprintf(body, 256, "Action=SendMessage&MessageBody=");
     memset(&body[pos], 'x', size);
-    sprintf(&body[pos + size], "&AWSAccessKeyId=RELQ7OTAGDO570Y9CMAQ&");
+    sprintf(&body[pos + size], "&AWSAccessKeyId=" ACCESSKEY "&");
 
     iobuf_init(&b);
 
@@ -178,12 +217,11 @@ int __send_message(int n, int size)
     curl_easy_setopt (ch, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt (ch, CURLOPT_WRITEDATA, &b);
 
+    ret = 0;
     for (i = 0; i < n; i++) {
-        CURLcode res;
-
-        res = curl_easy_perform(ch);
+        CURLcode res = curl_easy_perform(ch);
         if (res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n",
+            ERROR("curl_easy_perform() failed: %s\n",
                 curl_easy_strerror(res));
             break;
         }
@@ -192,16 +230,24 @@ int __send_message(int n, int size)
         assert(resp_len > b.total_len);
         iobuf_cpy(resp, &b);
         iobuf_free(&b);
-
         if (strncmp(resp, "<SendMessageResponse>",   
                 strlen("<SendMessageResponse>")) != 0) {
+            ERROR("1 %s\n", resp);
             break;
         }
 
-    }
+        if (msg_ids) {
+            int cnt = parse_send_msg(resp, strlen(resp), msg_ids);
+            if (cnt < 0) {
+                ERROR("2 %s\n", resp);
+                break;
+            }
+            while (cnt--) 
+                msg_ids += (strlen(msg_ids) + 1);
+        }
 
-    if (i == n)
-        ret = 0;
+        ret++;
+    }
 
 out : 
     free(body);
@@ -218,7 +264,162 @@ struct send_msg_args {
 void* send_message(void* tmp)
 {
     struct send_msg_args* args = tmp;
-    return (void*)__send_message(args->n, args->size);
+    return (void*)__send_message(args->n, args->size, 1, NULL);
+}
+
+void send_message_save(int n, int size)
+{
+    const int msg_id_len = 64;
+    char* msg_ids = malloc(msg_id_len * n);
+    int msgs, i, pos;
+    struct timespec start, end;
+    long long elapsed;
+    FILE* f0 = NULL;
+    int max_retry;
+
+    if (!msg_ids) { 
+        fprintf(stderr, "unable to allocate memory\n");
+        return;
+    }
+
+    if (!(f0 = fopen("sent_msg_id", "w"))) {
+        goto out;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    msgs = __send_message(n, size, 0, msg_ids);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    if (msgs < 0) {
+        fprintf(stderr, "unable to receive any messages\n");
+        goto out;
+    }
+
+    elapsed = (end.tv_sec - start.tv_sec) * 1000000000 + 
+            (end.tv_nsec - start.tv_nsec);
+    printf("%f elapsed \n", elapsed / 1000000000.0);
+    printf("%d messages left\n", n - msgs);
+
+    // print message ids
+    for (i = 0, pos = 0; i < msgs; i++) {
+        char* msg_id = &msg_ids[pos];
+        fprintf(f0, "%s\n", msg_id);
+        pos += (strlen(msg_id) + 1);
+    }
+
+    n -= msgs;
+    max_retry = 10;
+    while (n > 0 && max_retry) {
+        msgs = __send_message(n, size, 0, msg_ids);
+        if (msgs <= 0) {
+            fprintf(stderr, "unable to send, sleeping 1 second\n");
+            max_retry--;
+            sleep(1);
+            continue;
+        }
+
+        max_retry = 10;
+
+        for (i = 0, pos = 0; i < msgs; i++) {
+            char* msg_id = &msg_ids[pos];
+            fprintf(f0, "%s\n", msg_id);
+            pos += (strlen(msg_id) + 1);
+        }
+
+        n -= msgs;
+    }
+
+out : 
+    if (f0)
+        fclose(f0);
+    free(msg_ids);
+}
+
+////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
+// delete
+
+int del_message(const char* fn)
+{
+    FILE* f = fopen(fn, "r");
+    char* resp = NULL, line[MSGID_MAX_LEN];
+    CURL* ch = NULL;
+    int max_len = 1024, ret = -EINVAL, i;
+    struct iobuf b;
+    struct timespec start, end;
+    long long elapsed;
+
+    if (!f) {
+        fprintf(stderr, "unable to open file\n");
+        return -1;
+    }
+
+    ch = curl_easy_init();
+    if (!ch) {
+        fprintf(stderr, "unable to easy init\n");
+        goto out;
+    }
+
+    if (!(resp = malloc(max_len))) {
+        fprintf(stderr, "unable to alloc memory\n");
+        goto out;
+    }
+
+    iobuf_init(&b);
+
+    curl_easy_setopt (ch, CURLOPT_URL, 
+        "http://" HOSTNAME "/" HOSTID "/test_create_queue");
+    curl_easy_setopt (ch, CURLOPT_POST, 1 );
+    curl_easy_setopt (ch, CURLOPT_POSTFIELDS, resp);
+    curl_easy_setopt (ch, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt (ch, CURLOPT_WRITEDATA, &b);
+
+    i = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (fgets(line, sizeof(line), f) != NULL) {
+        CURLcode res;
+
+        line[strlen(line) - 1] = '\0';
+        sprintf(resp, "Action=DeleteMessage&ReceiptHandle=%s" 
+            "&AWSAccessKeyId=" ACCESSKEY "&", line);
+
+    retry : 
+        res = curl_easy_perform(ch);
+        if (res != CURLE_OK) {
+            // unable to perform 
+            fprintf(stderr, "unable to perform operation\n");
+            sleep(1);
+            goto retry;
+        }
+
+        iobuf_cpy(resp, &b);
+        iobuf_free(&b);
+        if (strncmp(resp, "<DeleteMessageResponse>",   
+                    strlen("<DeleteMessageResponse>")) != 0) {
+            // invalid resply
+            fprintf(stderr, "%s\n", resp);
+            sleep(1);
+            goto retry;
+        }
+
+        i++;
+        //if ((i % 1000) == 0)
+        //    printf("%d\n", i);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    elapsed = (end.tv_sec - start.tv_sec) * 1000000000 + 
+            (end.tv_nsec - start.tv_nsec);
+    printf("%f elapsed \n", elapsed / 1000000000.0);
+
+    ret = 0;
+
+out : 
+    free(resp);
+    if (ch)
+        curl_easy_cleanup(ch);
+    fclose(f);
+    return ret;
 }
 
 ////////////////////////////////////////////////////////////
@@ -271,7 +472,7 @@ thread_fail :
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "commands send, recieve\n");
+        fprintf(stderr, "commands send, recv, send_save, recv_save, del_saved \n");
         return -1;
     }
 
@@ -290,10 +491,9 @@ int main(int argc, char* argv[])
             return 0;
         return start_threads(threads, &send_message, &args);
     }
-    else if(strcmp(argv[1], "recv") == 0) { //receive all messages
+    else if (strcmp(argv[1], "recv") == 0) { //receive all messages
         if (argc != 4) {
             fprintf(stderr, "specify [msgs] [threads]\n");
-            fprintf(stderr, "invalid usage\n");
             return -1;
         }
         int n = strtoul(argv[2], NULL, 10);
@@ -301,6 +501,34 @@ int main(int argc, char* argv[])
         if (!n || !threads)
             return 0;
         return start_threads(threads, &recv_message, &n);
+    }
+    else if (strcmp(argv[1], "send_save") == 0) {
+        if (argc != 4) {
+            fprintf(stderr, "specify [size] [msgs] \n");
+            return -1;
+        }
+        int size = strtoul(argv[2], NULL, 10);
+        int n = strtoul(argv[3], NULL, 10);
+        if (!size || !n)
+            return 0;
+        send_message_save(n, size);
+    }
+    else if (strcmp(argv[1], "recv_save") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "specify [msgs] \n");
+            return -1;
+        }
+        int n = strtoul(argv[2], NULL, 10);
+        if (!n)
+            return 0;
+        recv_message_save(n);
+    }
+    else if (strcmp(argv[1], "del_saved") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "specify [msg IDs file] \n");
+            return -1;
+        }
+        del_message(argv[2]);
     }
 
     return 0;
